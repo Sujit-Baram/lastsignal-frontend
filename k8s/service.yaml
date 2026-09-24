@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lastsignal-frontend
+spec:
+  selector:
+    app: lastsignal-frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  # ClusterIP by default. Swap to LoadBalancer to get an ELB directly,
+  # or keep ClusterIP and put an Ingress / ALB in front of it.
+  type: ClusterIP
