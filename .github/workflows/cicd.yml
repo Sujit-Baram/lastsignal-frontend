@@ -1,0 +1,229 @@
+name: Deploy to AWS EKS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Build and Deploy to EKS
+    runs-on: ubuntu-latest
+
+    env:
+      ECR_NAME: lastsignal-frontend
+      ECR_ACCOUNT: 503009164523
+      AWS_REGION: us-east-1
+      CLUSTER_NAME: test-eks
+      DEPLOYMENT_NAME: lastsignal-frontend
+      CONTAINER_NAME: lastsignal-frontend
+      NAMESPACE: frontend-application
+
+    steps:
+
+      # 1. Checkout branch
+      - name: Checkout prd_grp2_trn branch
+        uses: actions/checkout@v4
+
+      # 2. Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3. Install kubectl
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: latest
+
+      # 4. Update kubeconfig for EKS dynamically
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "$CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+          kubectl config view
+          kubectl get nodes
+
+      # 5. Login to Amazon ECR
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password \
+            --region "$AWS_REGION" | \
+            docker login \
+            --username AWS \
+            --password-stdin \
+            "$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      # 6. Build Docker image
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t "$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_NAME:${{ github.sha }}" \
+            -f k8s/Dockerfile .
+
+      # 7. Scan Docker image with Trivy
+      - name: Scan Docker image with Trivy
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            wget \
+            apt-transport-https \
+            gnupg \
+            lsb-release
+
+          wget -qO - \
+            https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+            sudo apt-key add -
+
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | \
+            sudo tee /etc/apt/sources.list.d/trivy.list
+
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+          trivy image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            "$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_NAME:${{ github.sha }}"
+
+      # 8. Push Docker image to ECR
+      - name: Push Docker Image to ECR
+        run: |
+          docker push \
+            "$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_NAME:${{ github.sha }}"
+
+      # 9. Apply Kubernetes Deployment
+      - name: Apply Deployment YAML
+        run: |
+          kubectl apply \
+            -f k8s/deployment.yaml \
+            -n "$NAMESPACE"
+
+      # 10. Apply Kubernetes Service
+      - name: Apply Service YAML
+        run: |
+          kubectl apply \
+            -f k8s/service.yaml \
+            -n "$NAMESPACE"
+
+      # 11. Apply Kubernetes Ingress
+      - name: Apply Ingress YAML
+        run: |
+          kubectl apply \
+            -f k8s/ingress.yaml \
+            -n "$NAMESPACE"
+
+      # 12. Apply Kubernetes HPA
+      - name: Apply HPA YAML
+        run: |
+          kubectl apply \
+            -f k8s/hpa.yaml \
+            -n "$NAMESPACE"
+
+      # 13. Update deployment with latest image
+      - name: Update deployment with latest image
+        run: |
+          kubectl set image \
+            deployment/"$DEPLOYMENT_NAME" \
+            "$CONTAINER_NAME"="$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_NAME:${{ github.sha }}" \
+            -n "$NAMESPACE"
+
+      # 14. Wait for Deployment Rollout
+      - name: Wait for Rollout
+        run: |
+          if ! kubectl rollout status \
+            deployment/"$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            --timeout=100s; then
+
+            echo "====================================="
+            echo "Deployment Rollout Failed"
+            echo "====================================="
+
+            echo ""
+            echo "Deployment Details"
+            kubectl describe deployment \
+              "$DEPLOYMENT_NAME" \
+              -n "$NAMESPACE"
+
+            echo ""
+            echo "ReplicaSets"
+            kubectl get rs \
+              -n "$NAMESPACE"
+
+            echo ""
+            echo "Pods"
+            kubectl get pods \
+              -n "$NAMESPACE" \
+              -o wide
+
+            echo ""
+            echo "Events"
+            kubectl get events \
+              -n "$NAMESPACE" \
+              --sort-by='.lastTimestamp' | \
+              tail -50
+
+            exit 1
+          fi
+
+      # 15. Validate Deployment Health
+      - name: Validate Deployment Health
+        run: |
+
+          kubectl wait \
+            --for=condition=available \
+            deployment/"$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            --timeout=100s
+
+          echo ""
+          echo "Deployment"
+          kubectl get deployment \
+            "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE"
+
+          echo ""
+          echo "Pods"
+          kubectl get pods \
+            -n "$NAMESPACE" \
+            -l "app=$DEPLOYMENT_NAME" \
+            -o wide
+
+          READY=$(kubectl get deployment \
+            "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')
+
+          DESIRED=$(kubectl get deployment \
+            "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')
+
+          READY=${READY:-0}
+
+          echo ""
+          echo "Ready Replicas   : $READY"
+          echo "Desired Replicas : $DESIRED"
+
+          if [ "$READY" != "$DESIRED" ]; then
+            echo ""
+            echo "Deployment Validation Failed"
+            exit 1
+          fi
+
+          echo ""
+          echo "Deployment Validation Passed"
+
+      # 16. Cleanup Docker Login
+      - name: Cleanup Docker Login
+        if: always()
+        run: |
+          docker logout \
+            "$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
