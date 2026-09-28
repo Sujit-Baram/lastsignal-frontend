@@ -1,0 +1,30 @@
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lastsignal-frontend
+  namespace: frontend-application
+  labels:
+    app: lastsignal-frontend
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+spec:
+  ingressClassName: traefik
+
+  tls:
+    - hosts:
+        - lastsignal.friendscomputer.store
+      secretName: lastsignal-frontend-tls
+
+  rules:
+    - host: lastsignal.friendscomputer.store
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lastsignal-frontend
+                port:
+                  number: 80
